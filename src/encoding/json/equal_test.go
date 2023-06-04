@@ -32,21 +32,23 @@ type testEqual struct {
 }
 
 func ExampleEqual() {
-	json1 := `{"author":"北洛","country":"china","age":22,"gopher":true}`
-	json2 := `{"author":"北洛","gopher":true,"country":"china","age":22}`
-	json3 := `{"age":22,"pageNum":1,"author":"北洛"}`
-	json4 := `{"age":22,"pageNum":1,"author":"洛北"}`
-	json5 := `{"age":22,"pageNum":1}`
+	json1 := `{"author":"Hiro","country":"India","age":19,"gopher":true}`
+	json2 := `{"author":"Hiro","gopher":true,"country":"India","age":19}`
+	json3 := `{"age":19,"pageNum":1,"author":"Hiro"}`
+	json4 := `{"age":19,"pageNum":1,"author":"洛北"}`
+	json5 := `{"age":19,"pageNum":1}`
 
-	fmt.Println(Equal(json1, json2))        //Returns true if the structure is equal and the values are equal
-	fmt.Println(Equal(json1, json2, json3)) //To return true, multiple values must be evaluated and all values must be equivalent
-	fmt.Println(Equal(json3, json4))        //Structure is equal but values are not equal, not equivalent
-	fmt.Println(Equal(json3, json5))        //Returns false due to unequal structures
+	fmt.Println(Equal(json1, json2))                 //Returns true structures, values same, order different
+	fmt.Println(Equal(json1, json2, json3))          //Returns false
+	fmt.Println(Equal(json3, json4))                 //Returns false value different for key 'author'
+	fmt.Println(Equal(json3, json5))                 //Returns false structure different for key 'author'
+	fmt.Println(Equal([]byte(json1), []byte(json2))) //Returns true structures, values same, order different
 	//Output:
 	//true <nil>
 	//false <nil>
 	//false <nil>
 	//false <nil>
+	//true <nil>
 
 }
 func getTests() []testEqual {

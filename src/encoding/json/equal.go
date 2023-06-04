@@ -4,9 +4,13 @@ import (
 	"reflect"
 )
 
+type jsonType interface {
+	[]byte | string
+}
+
 // Eq Determine whether two JSON strings are equivalent
 // (with the same key value, in different order)
-func Eq(s1, s2 string) (bool, error) {
+func Eq[T jsonType](s1, s2 T) (bool, error) {
 	var i, i2 interface{}
 	err := Unmarshal([]byte(s1), &i)
 	if err != nil {
@@ -21,7 +25,7 @@ func Eq(s1, s2 string) (bool, error) {
 
 // Equal Determine whether two or more JSON strings are equivalent
 // (with the same key value and different order)
-func Equal(s1, s2 string, sN ...string) (bool, error) {
+func Equal[T jsonType](s1, s2 T, sN ...T) (bool, error) {
 	if len(sN) == 0 {
 		return Eq(s1, s2)
 	}
