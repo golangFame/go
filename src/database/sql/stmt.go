@@ -31,15 +31,6 @@ var (
 	_ stmtConnGrabber = &Conn{}
 )
 
-// Stmt is a prepared statement.
-// A Stmt is safe for concurrent use by multiple goroutines.
-//
-// If a Stmt is prepared on a Tx or Conn, it will be bound to a single
-// underlying connection forever. If the Tx or Conn closes, the Stmt will
-// become unusable and all operations will return an error.
-// If a Stmt is prepared on a _DB, it will remain usable for the lifetime of the
-// _DB. When the Stmt needs to execute on a new underlying connection, it will
-// prepare itself on the new connection automatically.
 type stmt struct {
 	// Immutable:
 	db        *_DB   // where we came from
@@ -78,6 +69,15 @@ type stmt struct {
 	lastNumClosed uint64
 }
 
+// Stmt is a prepared statement.
+// A Stmt is safe for concurrent use by multiple goroutines.
+//
+// If a Stmt is prepared on a Tx or Conn, it will be bound to a single
+// underlying connection forever. If the Tx or Conn closes, the Stmt will
+// become unusable and all operations will return an error.
+// If a Stmt is prepared on a _DB, it will remain usable for the lifetime of the
+// _DB. When the Stmt needs to execute on a new underlying connection, it will
+// prepare itself on the new connection automatically.
 type Stmt interface {
 	Close() error
 	Exec(args ...any) (Result, error)

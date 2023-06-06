@@ -11,18 +11,6 @@ import (
 	"time"
 )
 
-// DB is a database handle representing a pool of zero or more
-// underlying connections. It's safe for concurrent use by multiple
-// goroutines.
-//
-// The sql package creates and frees connections automatically; it
-// also maintains a free pool of idle connections. If the database has
-// a concept of per-connection state, such state can be reliably observed
-// within a transaction (Tx) or connection (Conn). Once DB.Begin is called, the
-// returned Tx is bound to a single connection. Once Commit or
-// Rollback is called on the transaction, that transaction's
-// connection is returned to DB's idle connection pool. The pool size
-// can be controlled with SetMaxIdleConns.
 type _DB struct {
 	// Total time waited for new connections.
 	waitDuration atomic.Int64
