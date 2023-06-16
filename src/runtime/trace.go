@@ -458,7 +458,7 @@ func StopTrace() {
 		trace.endTicks = cputicks()
 		trace.endNanotime = nanotime()
 		// Windows time can tick only every 15ms, wait for at least one tick.
-		if trace.endNanotime != trace.startNanotime {
+		if trace.endTicks != trace.startTicks {
 			break
 		}
 		osyield()
