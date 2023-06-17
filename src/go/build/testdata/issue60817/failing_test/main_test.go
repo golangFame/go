@@ -1,4 +1,4 @@
-package main
+package failing_test
 
 import "testing"
 
