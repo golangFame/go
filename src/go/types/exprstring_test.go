@@ -43,6 +43,11 @@ var testExprs = []testEntry{
 	dup("<-chan E"),
 	dup("chan<- E"),
 
+	// generic type expressions- constraints
+	dup("x[T]"),
+	dup("x[N | A | S]"),
+	dup("x[N, A]"),
+
 	// new interfaces
 	dup("interface{int}"),
 	dup("interface{~int}"),
