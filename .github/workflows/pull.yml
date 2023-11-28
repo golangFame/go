@@ -1,0 +1,69 @@
+name: Sync Fork with Upstream
+on:
+
+  push:
+    branches: [ "main","master" ]
+    tags:
+      - "*"
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  pull_request:
+    branches: [ "main","master" ]
+
+  schedule:
+    - cron: '0 */6 * * *'  # Run every day at midnight UTC
+  repository_dispatch:
+    types:
+      - sync-fork
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: read
+      packages: none
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          # fetch-depth: 0
+          clean: true
+          ref: master
+
+
+      - name: Configure Git
+        run: |
+          git config user.name Hiro
+          git config user.email laciferin@gmail.com
+          git remote add upstream https://go.googlesource.com/go 
+          git remote -v
+          git config pull.rebase true
+
+      #      - name: Fetch upstream changes
+      #        run: git fetch upstream
+
+      # - name: Setup upterm session
+      #   uses: lhotari/action-upterm@v1
+      #   timeout-minutes: 600
+
+      - name: Rebase upstream changes
+        run: git pull upstream master
+
+      - name: Push changes to fork
+        run: |
+          git log -n 2
+          git status
+          git push -f origin master 
+          git push -f --tags
