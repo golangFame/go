@@ -1594,7 +1594,7 @@ func (db *DB) prepare(ctx context.Context, query string, strategy connReuseStrat
 // prepareDC prepares a query on the driverConn and calls release before
 // returning. When cg == nil it implies that a connection pool is used, and
 // when cg != nil only a single driver connection is used.
-func (db *DB) prepareDC(ctx context.Context, dc *driverConn, release func(error), cg stmtConnGrabber, query string) (Stmt, error) {
+func (db *DB) prepareDC(ctx context.Context, dc *driverConn, release func(error), cg stmtConnGrabber, query string) (*Stmt, error) {
 	var ds *driverStmt
 	var err error
 	defer func() {
@@ -1606,7 +1606,7 @@ func (db *DB) prepareDC(ctx context.Context, dc *driverConn, release func(error)
 	if err != nil {
 		return nil, err
 	}
-	stmt_ := stmt{
+	stmt_ := &stmt{
 		db:    db,
 		query: query,
 		cg:    cg,
@@ -1618,11 +1618,13 @@ func (db *DB) prepareDC(ctx context.Context, dc *driverConn, release func(error)
 	// the DB.
 	if cg == nil {
 		stmt_.css = []connStmt{{dc, ds}}
-		stmt_.lastNumClosed = atomic.LoadUint64(&db.numClosed)
+		stmt_.lastNumClosed = db.numClosed.Load()
 		db.addDep(stmt_, stmt_)
 	}
 
-	return &stmt_, nil
+	var stmtRepo Stmt = stmt_
+
+	return &stmtRepo, nil
 }
 
 // ExecContext executes a query without returning any rows.
