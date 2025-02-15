@@ -6,7 +6,7 @@ package runtime
 
 import (
 	"internal/goarch"
-	"runtime/internal/atomic"
+	"internal/runtime/atomic"
 	"unsafe"
 )
 
@@ -144,7 +144,10 @@ func netpollBreak() {
 }
 
 // netpoll checks for ready network connections.
-// Returns list of goroutines that become runnable.
+// Returns a list of goroutines that become runnable,
+// and a delta to add to netpollWaiters.
+// This must never return an empty list with a non-zero delta.
+//
 // delay < 0: blocks indefinitely
 // delay == 0: does not block, just polls
 // delay > 0: block for up to that many nanoseconds
@@ -249,7 +252,7 @@ func netpollQueueTimer(delay int64) (signaled bool) {
 	// A wait completion packet can only be associated with one timer at a time,
 	// so we need to cancel the previous one if it exists. This wouldn't be necessary
 	// if the poller would only be woken up by the timer, in which case the association
-	// would be automatically cancelled, but it can also be woken up by other events,
+	// would be automatically canceled, but it can also be woken up by other events,
 	// such as a netpollBreak, so we can get to this point with a timer that hasn't
 	// expired yet. In this case, the completion packet can still be picked up by
 	// another thread, so defer the cancellation until it is really necessary.
@@ -271,7 +274,7 @@ func netpollQueueTimer(delay int64) (signaled bool) {
 			throw("runtime: netpoll failed")
 		}
 	case STATUS_PENDING:
-		// STATUS_PENDING is returned if the wait operation can't be cancelled yet.
+		// STATUS_PENDING is returned if the wait operation can't be canceled yet.
 		// This can happen if this thread was woken up by another event, such as a netpollBreak,
 		// and the timer expired just while calling NtCancelWaitCompletionPacket, in which case
 		// this call fails to cancel the association to avoid a race condition.

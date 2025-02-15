@@ -5,7 +5,8 @@
 package runtime
 
 import (
-	"runtime/internal/atomic"
+	"internal/abi"
+	"internal/runtime/atomic"
 	"unsafe"
 )
 
@@ -250,14 +251,67 @@ var crashFD atomic.Uintptr
 
 //go:linkname setCrashFD
 func setCrashFD(fd uintptr) uintptr {
-	return crashFD.Swap(fd)
+	// Don't change the crash FD if a crash is already in progress.
+	//
+	// Unlike the case below, this is not required for correctness, but it
+	// is generally nicer to have all of the crash output go to the same
+	// place rather than getting split across two different FDs.
+	if panicking.Load() > 0 {
+		return ^uintptr(0)
+	}
+
+	old := crashFD.Swap(fd)
+
+	// If we are panicking, don't return the old FD to runtime/debug for
+	// closing. writeErrData may have already read the old FD from crashFD
+	// before the swap and closing it would cause the write to be lost [1].
+	// The old FD will never be closed, but we are about to crash anyway.
+	//
+	// On the writeErrData thread, panicking.Add(1) happens-before
+	// crashFD.Load() [2].
+	//
+	// On this thread, swapping old FD for new in crashFD happens-before
+	// panicking.Load() > 0.
+	//
+	// Therefore, if panicking.Load() == 0 here (old FD will be closed), it
+	// is impossible for the writeErrData thread to observe
+	// crashFD.Load() == old FD.
+	//
+	// [1] Or, if really unlucky, another concurrent open could reuse the
+	// FD, sending the write into an unrelated file.
+	//
+	// [2] If gp != nil, it occurs when incrementing gp.m.dying in
+	// startpanic_m. If gp == nil, we read panicking.Load() > 0, so an Add
+	// must have happened-before.
+	if panicking.Load() > 0 {
+		return ^uintptr(0)
+	}
+	return old
 }
 
 // auxv is populated on relevant platforms but defined here for all platforms
-// so x/sys/cpu can assume the getAuxv symbol exists without keeping its list
-// of auxv-using GOOS build tags in sync.
+// so x/sys/cpu and x/sys/unix can assume the getAuxv symbol exists without
+// keeping its list of auxv-using GOOS build tags in sync.
 //
 // It contains an even number of elements, (tag, value) pairs.
 var auxv []uintptr
 
-func getAuxv() []uintptr { return auxv } // accessed from x/sys/cpu; see issue 57336
+// golang.org/x/sys/cpu and golang.org/x/sys/unix use getAuxv via linkname.
+// Do not remove or change the type signature.
+// See go.dev/issue/57336 and go.dev/issue/67401.
+//
+//go:linkname getAuxv
+func getAuxv() []uintptr { return auxv }
+
+// zeroVal is used by reflect via linkname.
+//
+// zeroVal should be an internal detail,
+// but widely used packages access it using linkname.
+// Notable members of the hall of shame include:
+//   - github.com/ugorji/go/codec
+//
+// Do not remove or change the type signature.
+// See go.dev/issue/67401.
+//
+//go:linkname zeroVal
+var zeroVal [abi.ZeroValSize]byte

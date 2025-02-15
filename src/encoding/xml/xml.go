@@ -492,8 +492,12 @@ func (d *Decoder) popElement(t *EndElement) bool {
 		d.err = d.syntaxError("element <" + s.name.Local + "> closed by </" + name.Local + ">")
 		return false
 	case s.name.Space != name.Space:
+		ns := name.Space
+		if name.Space == "" {
+			ns = `""`
+		}
 		d.err = d.syntaxError("element <" + s.name.Local + "> in space " + s.name.Space +
-			" closed by </" + name.Local + "> in space " + name.Space)
+			" closed by </" + name.Local + "> in space " + ns)
 		return false
 	}
 
@@ -1000,8 +1004,9 @@ Input:
 		}
 
 		// <![CDATA[ section ends with ]]>.
-		// It is an error for ]]> to appear in ordinary text.
-		if b0 == ']' && b1 == ']' && b == '>' {
+		// It is an error for ]]> to appear in ordinary text,
+		// but it is allowed in quoted strings.
+		if quote < 0 && b0 == ']' && b1 == ']' && b == '>' {
 			if cdata {
 				trunc = 2
 				break Input

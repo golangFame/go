@@ -8,6 +8,7 @@
 // and cause a compiler warning. This results in a build failure since
 // cgo uses -Werror. See #65290.
 #pragma GCC diagnostic ignored "-Wpragmas"
+#pragma GCC diagnostic ignored "-Wunknown-warning-option"
 #pragma GCC diagnostic ignored "-Watomic-alignment"
 
 #include <pthread.h>
@@ -36,8 +37,12 @@ static void (*cgo_context_function)(struct context_arg*);
 
 void
 x_cgo_sys_thread_create(void* (*func)(void*), void* arg) {
+	pthread_attr_t attr;
 	pthread_t p;
-	int err = _cgo_try_pthread_create(&p, NULL, func, arg);
+
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	int err = _cgo_try_pthread_create(&p, &attr, func, arg);
 	if (err != 0) {
 		fprintf(stderr, "pthread_create failed: %s", strerror(err));
 		abort();
@@ -152,7 +157,6 @@ _cgo_try_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*p
 	for (tries = 0; tries < 20; tries++) {
 		err = pthread_create(thread, attr, pfn, arg);
 		if (err == 0) {
-			pthread_detach(*thread);
 			return 0;
 		}
 		if (err != EAGAIN) {

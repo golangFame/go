@@ -36,6 +36,7 @@ import (
 	"cmd/internal/objabi"
 	"cmd/internal/quoted"
 	"cmd/internal/sys"
+	"cmd/internal/telemetry/counter"
 	"cmd/link/internal/benchmark"
 	"flag"
 	"internal/buildcfg"
@@ -63,9 +64,11 @@ func init() {
 // Flags used by the linker. The exported flags are used by the architecture-specific packages.
 var (
 	flagBuildid = flag.String("buildid", "", "record `id` as Go toolchain build id")
+	flagBindNow = flag.Bool("bindnow", false, "mark a dynamically linked ELF object for immediate function binding")
 
 	flagOutfile    = flag.String("o", "", "write output to `file`")
 	flagPluginPath = flag.String("pluginpath", "", "full path name for plugin")
+	flagFipso      = flag.String("fipso", "", "write fips module to `file`")
 
 	flagInstallSuffix = flag.String("installsuffix", "", "set package directory `suffix`")
 	flagDumpDep       = flag.Bool("dumpdep", false, "dump symbol dependency graph")
@@ -93,7 +96,9 @@ var (
 	flagN             = flag.Bool("n", false, "no-op (deprecated)")
 	FlagS             = flag.Bool("s", false, "disable symbol table")
 	flag8             bool // use 64-bit addresses in symbol table
+	flagHostBuildid   = flag.String("B", "", "set ELF NT_GNU_BUILD_ID `note` or Mach-O UUID; use \"gobuildid\" to generate it from the Go build ID; \"none\" to disable")
 	flagInterpreter   = flag.String("I", "", "use `linker` as ELF dynamic linker")
+	flagCheckLinkname = flag.Bool("checklinkname", true, "check linkname symbol references")
 	FlagDebugTramp    = flag.Int("debugtramp", 0, "debug trampolines")
 	FlagDebugTextSize = flag.Int("debugtextsize", 0, "debug text section max size")
 	flagDebugNosplit  = flag.Bool("debugnosplit", false, "dump nosplit call graph")
@@ -103,6 +108,7 @@ var (
 	flagEntrySymbol   = flag.String("E", "", "set `entry` symbol name")
 	flagPruneWeakMap  = flag.Bool("pruneweakmap", true, "prune weak mapinit refs")
 	flagRandLayout    = flag.Int64("randlayout", 0, "randomize function layout")
+	flagAllErrors     = flag.Bool("e", false, "no limit on number of errors reported")
 	cpuprofile        = flag.String("cpuprofile", "", "write cpu profile to `file`")
 	memprofile        = flag.String("memprofile", "", "write memory profile to `file`")
 	memprofilerate    = flag.Int64("memprofilerate", 0, "set runtime.MemProfileRate to `rate`")
@@ -154,6 +160,8 @@ func (t *ternaryFlag) IsBoolFlag() bool { return true } // parse like a boolean 
 func Main(arch *sys.Arch, theArch Arch) {
 	log.SetPrefix("link: ")
 	log.SetFlags(0)
+	counter.Open()
+	counter.Inc("link/invocations")
 
 	thearch = theArch
 	ctxt := linknew(arch)
@@ -191,7 +199,6 @@ func Main(arch *sys.Arch, theArch Arch) {
 	flag.Var(&ctxt.LinkMode, "linkmode", "set link `mode`")
 	flag.Var(&ctxt.BuildMode, "buildmode", "set build `mode`")
 	flag.BoolVar(&ctxt.compressDWARF, "compressdwarf", true, "compress DWARF if possible")
-	objabi.Flagfn1("B", "add an ELF NT_GNU_BUILD_ID `note` when using ELF; use \"gobuildid\" to generate it from the Go build ID", addbuildinfo)
 	objabi.Flagfn1("L", "add specified `directory` to library path", func(a string) { Lflag(ctxt, a) })
 	objabi.AddVersionFlag() // -V
 	objabi.Flagfn1("X", "add string value `definition` of the form importpath.name=value", func(s string) { addstrdata1(ctxt, s) })
@@ -199,6 +206,7 @@ func Main(arch *sys.Arch, theArch Arch) {
 	objabi.Flagfn1("importcfg", "read import configuration from `file`", ctxt.readImportCfg)
 
 	objabi.Flagparse(usage)
+	counter.CountFlags("link/flag:", *flag.CommandLine)
 
 	if ctxt.Debugvlog > 0 {
 		// dump symbol info on crash
@@ -220,7 +228,7 @@ func Main(arch *sys.Arch, theArch Arch) {
 		windowsgui = true
 	default:
 		if err := ctxt.HeadType.Set(*flagHeadType); err != nil {
-			Errorf(nil, "%v", err)
+			Errorf("%v", err)
 			usage()
 		}
 	}
@@ -229,7 +237,7 @@ func Main(arch *sys.Arch, theArch Arch) {
 	}
 
 	if !*flagAslr && ctxt.BuildMode != BuildModeCShared {
-		Errorf(nil, "-aslr=false is only allowed for -buildmode=c-shared")
+		Errorf("-aslr=false is only allowed for -buildmode=c-shared")
 		usage()
 	}
 
@@ -288,6 +296,11 @@ func Main(arch *sys.Arch, theArch Arch) {
 		*flagBuildid = "go-openbsd"
 	}
 
+	if *flagHostBuildid == "" && *flagBuildid != "" {
+		*flagHostBuildid = "gobuildid"
+	}
+	addbuildinfo(ctxt)
+
 	// enable benchmarking
 	var bench *benchmark.Metrics
 	if len(*benchmarkFlag) != 0 {
@@ -296,7 +309,7 @@ func Main(arch *sys.Arch, theArch Arch) {
 		} else if *benchmarkFlag == "cpu" {
 			bench = benchmark.New(benchmark.NoGC, *benchmarkFileFlag)
 		} else {
-			Errorf(nil, "unknown benchmark flag: %q", *benchmarkFlag)
+			Errorf("unknown benchmark flag: %q", *benchmarkFlag)
 			usage()
 		}
 	}
@@ -443,7 +456,6 @@ func Main(arch *sys.Arch, theArch Arch) {
 	// will be applied directly there.
 	bench.Start("Asmb")
 	asmb(ctxt)
-
 	exitIfErrors()
 
 	// Generate additional symbols for the native symbol table just prior
@@ -452,6 +464,8 @@ func Main(arch *sys.Arch, theArch Arch) {
 	if thearch.GenSymsLate != nil {
 		thearch.GenSymsLate(ctxt, ctxt.loader)
 	}
+
+	asmbfips(ctxt, *flagFipso)
 
 	bench.Start("Asmb2")
 	asmb2(ctxt)
@@ -498,7 +512,12 @@ func startProfile() {
 		if err := pprof.StartCPUProfile(f); err != nil {
 			log.Fatalf("%v", err)
 		}
-		AtExit(pprof.StopCPUProfile)
+		AtExit(func() {
+			pprof.StopCPUProfile()
+			if err = f.Close(); err != nil {
+				log.Fatalf("error closing cpu profile: %v", err)
+			}
+		})
 	}
 	if *memprofile != "" {
 		if *memprofilerate != 0 {
@@ -517,6 +536,10 @@ func startProfile() {
 			const writeLegacyFormat = 1
 			if err := pprof.Lookup("heap").WriteTo(f, writeLegacyFormat); err != nil {
 				log.Fatalf("%v", err)
+			}
+			// Close the file after writing the profile.
+			if err := f.Close(); err != nil {
+				log.Fatalf("could not close %v: %v", *memprofile, err)
 			}
 		})
 	}

@@ -14,12 +14,12 @@ package netip
 import (
 	"cmp"
 	"errors"
+	"internal/bytealg"
+	"internal/byteorder"
+	"internal/itoa"
 	"math"
 	"strconv"
-
-	"internal/bytealg"
-	"internal/intern"
-	"internal/itoa"
+	"unique"
 )
 
 // Sizes: (64-bit)
@@ -53,22 +53,22 @@ type Addr struct {
 	// bytewise processing.
 	addr uint128
 
-	// z is a combination of the address family and the IPv6 zone.
-	//
-	// nil means invalid IP address (for a zero Addr).
-	// z4 means an IPv4 address.
-	// z6noz means an IPv6 address without a zone.
-	//
-	// Otherwise it's the interned zone name string.
-	z *intern.Value
+	// Details about the address, wrapped up together and canonicalized.
+	z unique.Handle[addrDetail]
+}
+
+// addrDetail represents the details of an Addr, like address family and IPv6 zone.
+type addrDetail struct {
+	isV6   bool   // IPv4 is false, IPv6 is true.
+	zoneV6 string // != "" only if IsV6 is true.
 }
 
 // z0, z4, and z6noz are sentinel Addr.z values.
 // See the Addr type's field docs.
 var (
-	z0    = (*intern.Value)(nil)
-	z4    = new(intern.Value)
-	z6noz = new(intern.Value)
+	z0    unique.Handle[addrDetail]
+	z4    = unique.Make(addrDetail{})
+	z6noz = unique.Make(addrDetail{isV6: true})
 )
 
 // IPv6LinkLocalAllNodes returns the IPv6 link-local all nodes multicast
@@ -102,8 +102,8 @@ func AddrFrom4(addr [4]byte) Addr {
 func AddrFrom16(addr [16]byte) Addr {
 	return Addr{
 		addr: uint128{
-			beUint64(addr[:8]),
-			beUint64(addr[8:]),
+			byteorder.BEUint64(addr[:8]),
+			byteorder.BEUint64(addr[8:]),
 		},
 		z: z6noz,
 	}
@@ -251,6 +251,10 @@ func parseIPv6(in string) (Addr, error) {
 			} else {
 				break
 			}
+			if off > 3 {
+				//more than 4 digits in group, fail.
+				return Addr{}, parseAddrError{in: in, msg: "each group must have 4 or less digits", at: s}
+			}
 			if acc > math.MaxUint16 {
 				// Overflow, fail.
 				return Addr{}, parseAddrError{in: in, msg: "IPv6 field has value >=2^16", at: s}
@@ -331,9 +335,7 @@ func parseIPv6(in string) (Addr, error) {
 		for j := i - 1; j >= ellipsis; j-- {
 			ip[j+n] = ip[j]
 		}
-		for j := ellipsis + n - 1; j >= ellipsis; j-- {
-			ip[j] = 0
-		}
+		clear(ip[ellipsis : ellipsis+n])
 	} else if ellipsis >= 0 {
 		// Ellipsis must represent at least one 0 group.
 		return Addr{}, parseAddrError{in: in, msg: "the :: must expand to at least one field of zeros"}
@@ -405,11 +407,10 @@ func (ip Addr) BitLen() int {
 
 // Zone returns ip's IPv6 scoped addressing zone, if any.
 func (ip Addr) Zone() string {
-	if ip.z == nil {
+	if ip.z == z0 {
 		return ""
 	}
-	zone, _ := ip.z.Get().(string)
-	return zone
+	return ip.z.Value().zoneV6
 }
 
 // Compare returns an integer comparing two IPs.
@@ -461,7 +462,9 @@ func (ip Addr) Is4() bool {
 	return ip.z == z4
 }
 
-// Is4In6 reports whether ip is an IPv4-mapped IPv6 address.
+// Is4In6 reports whether ip is an "IPv4-mapped IPv6 address"
+// as defined by RFC 4291.
+// That is, it reports whether ip is in ::ffff:0:0/96.
 func (ip Addr) Is4In6() bool {
 	return ip.Is6() && ip.addr.hi == 0 && ip.addr.lo>>32 == 0xffff
 }
@@ -494,7 +497,7 @@ func (ip Addr) WithZone(zone string) Addr {
 		ip.z = z6noz
 		return ip
 	}
-	ip.z = intern.GetByString(zone)
+	ip.z = unique.Make(addrDetail{isV6: true, zoneV6: zone})
 	return ip
 }
 
@@ -515,6 +518,10 @@ func (ip Addr) hasZone() bool {
 
 // IsLinkLocalUnicast reports whether ip is a link-local unicast address.
 func (ip Addr) IsLinkLocalUnicast() bool {
+	if ip.Is4In6() {
+		ip = ip.Unmap()
+	}
+
 	// Dynamic Configuration of IPv4 Link-Local Addresses
 	// https://datatracker.ietf.org/doc/html/rfc3927#section-2.1
 	if ip.Is4() {
@@ -530,6 +537,10 @@ func (ip Addr) IsLinkLocalUnicast() bool {
 
 // IsLoopback reports whether ip is a loopback address.
 func (ip Addr) IsLoopback() bool {
+	if ip.Is4In6() {
+		ip = ip.Unmap()
+	}
+
 	// Requirements for Internet Hosts -- Communication Layers (3.2.1.3 Addressing)
 	// https://datatracker.ietf.org/doc/html/rfc1122#section-3.2.1.3
 	if ip.Is4() {
@@ -545,6 +556,10 @@ func (ip Addr) IsLoopback() bool {
 
 // IsMulticast reports whether ip is a multicast address.
 func (ip Addr) IsMulticast() bool {
+	if ip.Is4In6() {
+		ip = ip.Unmap()
+	}
+
 	// Host Extensions for IP Multicasting (4. HOST GROUP ADDRESSES)
 	// https://datatracker.ietf.org/doc/html/rfc1112#section-4
 	if ip.Is4() {
@@ -563,7 +578,7 @@ func (ip Addr) IsMulticast() bool {
 func (ip Addr) IsInterfaceLocalMulticast() bool {
 	// IPv6 Addressing Architecture (2.7.1. Pre-Defined Multicast Addresses)
 	// https://datatracker.ietf.org/doc/html/rfc4291#section-2.7.1
-	if ip.Is6() {
+	if ip.Is6() && !ip.Is4In6() {
 		return ip.v6u16(0)&0xff0f == 0xff01
 	}
 	return false // zero value
@@ -571,6 +586,10 @@ func (ip Addr) IsInterfaceLocalMulticast() bool {
 
 // IsLinkLocalMulticast reports whether ip is a link-local multicast address.
 func (ip Addr) IsLinkLocalMulticast() bool {
+	if ip.Is4In6() {
+		ip = ip.Unmap()
+	}
+
 	// IPv4 Multicast Guidelines (4. Local Network Control Block (224.0.0/24))
 	// https://datatracker.ietf.org/doc/html/rfc5771#section-4
 	if ip.Is4() {
@@ -599,6 +618,10 @@ func (ip Addr) IsGlobalUnicast() bool {
 		return false
 	}
 
+	if ip.Is4In6() {
+		ip = ip.Unmap()
+	}
+
 	// Match package net's IsGlobalUnicast logic. Notably private IPv4 addresses
 	// and ULA IPv6 addresses are still considered "global unicast".
 	if ip.Is4() && (ip == IPv4Unspecified() || ip == AddrFrom4([4]byte{255, 255, 255, 255})) {
@@ -616,6 +639,10 @@ func (ip Addr) IsGlobalUnicast() bool {
 // ip is in 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, or fc00::/7. This is the
 // same as [net.IP.IsPrivate].
 func (ip Addr) IsPrivate() bool {
+	if ip.Is4In6() {
+		ip = ip.Unmap()
+	}
+
 	// Match the stdlib's IsPrivate logic.
 	if ip.Is4() {
 		// RFC 1918 allocates 10.0.0.0/8, 172.16.0.0/12, and 192.168.0.0/16 as
@@ -675,8 +702,8 @@ func (ip Addr) Prefix(b int) (Prefix, error) {
 // [Addr.Zone] method to get it).
 // The ip zero value returns all zeroes.
 func (ip Addr) As16() (a16 [16]byte) {
-	bePutUint64(a16[:8], ip.addr.hi)
-	bePutUint64(a16[8:], ip.addr.lo)
+	byteorder.BEPutUint64(a16[:8], ip.addr.hi)
+	byteorder.BEPutUint64(a16[8:], ip.addr.lo)
 	return a16
 }
 
@@ -685,7 +712,7 @@ func (ip Addr) As16() (a16 [16]byte) {
 // Note that 0.0.0.0 is not the zero Addr.
 func (ip Addr) As4() (a4 [4]byte) {
 	if ip.z == z4 || ip.Is4In6() {
-		bePutUint32(a4[:], uint32(ip.addr.lo))
+		byteorder.BEPutUint32(a4[:], uint32(ip.addr.lo))
 		return a4
 	}
 	if ip.z == z0 {
@@ -701,12 +728,12 @@ func (ip Addr) AsSlice() []byte {
 		return nil
 	case z4:
 		var ret [4]byte
-		bePutUint32(ret[:], uint32(ip.addr.lo))
+		byteorder.BEPutUint32(ret[:], uint32(ip.addr.lo))
 		return ret[:]
 	default:
 		var ret [16]byte
-		bePutUint64(ret[:8], ip.addr.hi)
-		bePutUint64(ret[8:], ip.addr.lo)
+		byteorder.BEPutUint64(ret[:8], ip.addr.hi)
+		byteorder.BEPutUint64(ret[8:], ip.addr.lo)
 		return ret[:]
 	}
 }
@@ -941,27 +968,32 @@ func (ip Addr) StringExpanded() string {
 	return string(ret)
 }
 
+// AppendText implements the [encoding.TextAppender] interface,
+// It is the same as [Addr.AppendTo].
+func (ip Addr) AppendText(b []byte) ([]byte, error) {
+	return ip.AppendTo(b), nil
+}
+
 // MarshalText implements the [encoding.TextMarshaler] interface,
 // The encoding is the same as returned by [Addr.String], with one exception:
 // If ip is the zero [Addr], the encoding is the empty string.
 func (ip Addr) MarshalText() ([]byte, error) {
+	buf := []byte{}
 	switch ip.z {
 	case z0:
-		return []byte(""), nil
 	case z4:
-		max := len("255.255.255.255")
-		b := make([]byte, 0, max)
-		return ip.appendTo4(b), nil
+		const maxCap = len("255.255.255.255")
+		buf = make([]byte, 0, maxCap)
 	default:
 		if ip.Is4In6() {
-			max := len("::ffff:255.255.255.255%enp5s0")
-			b := make([]byte, 0, max)
-			return ip.appendTo4In6(b), nil
+			const maxCap = len("::ffff:255.255.255.255%enp5s0")
+			buf = make([]byte, 0, maxCap)
+			break
 		}
-		max := len("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff%enp5s0")
-		b := make([]byte, 0, max)
-		return ip.appendTo6(b), nil
+		const maxCap = len("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff%enp5s0")
+		buf = make([]byte, 0, maxCap)
 	}
+	return ip.AppendText(buf)
 }
 
 // UnmarshalText implements the encoding.TextUnmarshaler interface.
@@ -979,22 +1011,29 @@ func (ip *Addr) UnmarshalText(text []byte) error {
 	return err
 }
 
-func (ip Addr) marshalBinaryWithTrailingBytes(trailingBytes int) []byte {
-	var b []byte
+// AppendBinary implements the [encoding.BinaryAppender] interface.
+func (ip Addr) AppendBinary(b []byte) ([]byte, error) {
 	switch ip.z {
 	case z0:
-		b = make([]byte, trailingBytes)
 	case z4:
-		b = make([]byte, 4+trailingBytes)
-		bePutUint32(b, uint32(ip.addr.lo))
+		b = byteorder.BEAppendUint32(b, uint32(ip.addr.lo))
 	default:
-		z := ip.Zone()
-		b = make([]byte, 16+len(z)+trailingBytes)
-		bePutUint64(b[:8], ip.addr.hi)
-		bePutUint64(b[8:], ip.addr.lo)
-		copy(b[16:], z)
+		b = byteorder.BEAppendUint64(b, ip.addr.hi)
+		b = byteorder.BEAppendUint64(b, ip.addr.lo)
+		b = append(b, ip.Zone()...)
 	}
-	return b
+	return b, nil
+}
+
+func (ip Addr) marshalBinarySize() int {
+	switch ip.z {
+	case z0:
+		return 0
+	case z4:
+		return 4
+	default:
+		return 16 + len(ip.Zone())
+	}
 }
 
 // MarshalBinary implements the [encoding.BinaryMarshaler] interface.
@@ -1002,7 +1041,7 @@ func (ip Addr) marshalBinaryWithTrailingBytes(trailingBytes int) []byte {
 // the 4-byte form for an IPv4 address,
 // and the 16-byte form with zone appended for an IPv6 address.
 func (ip Addr) MarshalBinary() ([]byte, error) {
-	return ip.marshalBinaryWithTrailingBytes(0), nil
+	return ip.AppendBinary(make([]byte, 0, ip.marshalBinarySize()))
 }
 
 // UnmarshalBinary implements the [encoding.BinaryUnmarshaler] interface.
@@ -1173,21 +1212,27 @@ func (p AddrPort) AppendTo(b []byte) []byte {
 	return b
 }
 
+// AppendText implements the [encoding.TextAppender] interface. The
+// encoding is the same as returned by [AddrPort.AppendTo].
+func (p AddrPort) AppendText(b []byte) ([]byte, error) {
+	return p.AppendTo(b), nil
+}
+
 // MarshalText implements the [encoding.TextMarshaler] interface. The
 // encoding is the same as returned by [AddrPort.String], with one exception: if
 // p.Addr() is the zero [Addr], the encoding is the empty string.
 func (p AddrPort) MarshalText() ([]byte, error) {
-	var max int
+	buf := []byte{}
 	switch p.ip.z {
 	case z0:
 	case z4:
-		max = len("255.255.255.255:65535")
+		const maxCap = len("255.255.255.255:65535")
+		buf = make([]byte, 0, maxCap)
 	default:
-		max = len("[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff%enp5s0]:65535")
+		const maxCap = len("[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff%enp5s0]:65535")
+		buf = make([]byte, 0, maxCap)
 	}
-	b := make([]byte, 0, max)
-	b = p.AppendTo(b)
-	return b, nil
+	return p.AppendText(buf)
 }
 
 // UnmarshalText implements the encoding.TextUnmarshaler
@@ -1203,13 +1248,22 @@ func (p *AddrPort) UnmarshalText(text []byte) error {
 	return err
 }
 
+// AppendBinary implements the [encoding.BinaryAppendler] interface.
+// It returns [Addr.AppendBinary] with an additional two bytes appended
+// containing the port in little-endian.
+func (p AddrPort) AppendBinary(b []byte) ([]byte, error) {
+	b, err := p.Addr().AppendBinary(b)
+	if err != nil {
+		return nil, err
+	}
+	return byteorder.LEAppendUint16(b, p.Port()), nil
+}
+
 // MarshalBinary implements the [encoding.BinaryMarshaler] interface.
 // It returns [Addr.MarshalBinary] with an additional two bytes appended
 // containing the port in little-endian.
 func (p AddrPort) MarshalBinary() ([]byte, error) {
-	b := p.Addr().marshalBinaryWithTrailingBytes(2)
-	lePutUint16(b[len(b)-2:], p.Port())
-	return b, nil
+	return p.AppendBinary(make([]byte, 0, p.Addr().marshalBinarySize()+2))
 }
 
 // UnmarshalBinary implements the [encoding.BinaryUnmarshaler] interface.
@@ -1223,7 +1277,7 @@ func (p *AddrPort) UnmarshalBinary(b []byte) error {
 	if err != nil {
 		return err
 	}
-	*p = AddrPortFrom(addr, leUint16(b[len(b)-2:]))
+	*p = AddrPortFrom(addr, byteorder.LEUint16(b[len(b)-2:]))
 	return nil
 }
 
@@ -1294,6 +1348,15 @@ func (p Prefix) compare(p2 Prefix) int {
 	return p.Addr().Compare(p2.Addr())
 }
 
+type parsePrefixError struct {
+	in  string // the string given to ParsePrefix
+	msg string // an explanation of the parse failure
+}
+
+func (err parsePrefixError) Error() string {
+	return "netip.ParsePrefix(" + strconv.Quote(err.in) + "): " + err.msg
+}
+
 // ParsePrefix parses s as an IP address prefix.
 // The string can be in the form "192.168.1.0/24" or "2001:db8::/32",
 // the CIDR notation defined in RFC 4632 and RFC 4291.
@@ -1304,34 +1367,34 @@ func (p Prefix) compare(p2 Prefix) int {
 func ParsePrefix(s string) (Prefix, error) {
 	i := bytealg.LastIndexByteString(s, '/')
 	if i < 0 {
-		return Prefix{}, errors.New("netip.ParsePrefix(" + strconv.Quote(s) + "): no '/'")
+		return Prefix{}, parsePrefixError{in: s, msg: "no '/'"}
 	}
 	ip, err := ParseAddr(s[:i])
 	if err != nil {
-		return Prefix{}, errors.New("netip.ParsePrefix(" + strconv.Quote(s) + "): " + err.Error())
+		return Prefix{}, parsePrefixError{in: s, msg: err.Error()}
 	}
 	// IPv6 zones are not allowed: https://go.dev/issue/51899
 	if ip.Is6() && ip.z != z6noz {
-		return Prefix{}, errors.New("netip.ParsePrefix(" + strconv.Quote(s) + "): IPv6 zones cannot be present in a prefix")
+		return Prefix{}, parsePrefixError{in: s, msg: "IPv6 zones cannot be present in a prefix"}
 	}
 
 	bitsStr := s[i+1:]
 
 	// strconv.Atoi accepts a leading sign and leading zeroes, but we don't want that.
 	if len(bitsStr) > 1 && (bitsStr[0] < '1' || bitsStr[0] > '9') {
-		return Prefix{}, errors.New("netip.ParsePrefix(" + strconv.Quote(s) + "): bad bits after slash: " + strconv.Quote(bitsStr))
+		return Prefix{}, parsePrefixError{in: s, msg: "bad bits after slash: " + strconv.Quote(bitsStr)}
 	}
 
 	bits, err := strconv.Atoi(bitsStr)
 	if err != nil {
-		return Prefix{}, errors.New("netip.ParsePrefix(" + strconv.Quote(s) + "): bad bits after slash: " + strconv.Quote(bitsStr))
+		return Prefix{}, parsePrefixError{in: s, msg: "bad bits after slash: " + strconv.Quote(bitsStr)}
 	}
 	maxBits := 32
 	if ip.Is6() {
 		maxBits = 128
 	}
 	if bits < 0 || bits > maxBits {
-		return Prefix{}, errors.New("netip.ParsePrefix(" + strconv.Quote(s) + "): prefix length out of range")
+		return Prefix{}, parsePrefixError{in: s, msg: "prefix length out of range"}
 	}
 	return PrefixFrom(ip, bits), nil
 }
@@ -1453,21 +1516,27 @@ func (p Prefix) AppendTo(b []byte) []byte {
 	return b
 }
 
+// AppendText implements the [encoding.TextAppender] interface.
+// It is the same as [Prefix.AppendTo].
+func (p Prefix) AppendText(b []byte) ([]byte, error) {
+	return p.AppendTo(b), nil
+}
+
 // MarshalText implements the [encoding.TextMarshaler] interface,
 // The encoding is the same as returned by [Prefix.String], with one exception:
 // If p is the zero value, the encoding is the empty string.
 func (p Prefix) MarshalText() ([]byte, error) {
-	var max int
+	buf := []byte{}
 	switch p.ip.z {
 	case z0:
 	case z4:
-		max = len("255.255.255.255/32")
+		const maxCap = len("255.255.255.255/32")
+		buf = make([]byte, 0, maxCap)
 	default:
-		max = len("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff%enp5s0/128")
+		const maxCap = len("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff%enp5s0/128")
+		buf = make([]byte, 0, maxCap)
 	}
-	b := make([]byte, 0, max)
-	b = p.AppendTo(b)
-	return b, nil
+	return p.AppendText(buf)
 }
 
 // UnmarshalText implements the encoding.TextUnmarshaler interface.
@@ -1483,13 +1552,23 @@ func (p *Prefix) UnmarshalText(text []byte) error {
 	return err
 }
 
+// AppendBinary implements the [encoding.AppendMarshaler] interface.
+// It returns [Addr.AppendBinary] with an additional byte appended
+// containing the prefix bits.
+func (p Prefix) AppendBinary(b []byte) ([]byte, error) {
+	b, err := p.Addr().withoutZone().AppendBinary(b)
+	if err != nil {
+		return nil, err
+	}
+	return append(b, uint8(p.Bits())), nil
+}
+
 // MarshalBinary implements the [encoding.BinaryMarshaler] interface.
 // It returns [Addr.MarshalBinary] with an additional byte appended
 // containing the prefix bits.
 func (p Prefix) MarshalBinary() ([]byte, error) {
-	b := p.Addr().withoutZone().marshalBinaryWithTrailingBytes(1)
-	b[len(b)-1] = uint8(p.Bits())
-	return b, nil
+	// without the zone the max length is 16, plus an additional byte is 17
+	return p.AppendBinary(make([]byte, 0, p.Addr().withoutZone().marshalBinarySize()+1))
 }
 
 // UnmarshalBinary implements the [encoding.BinaryUnmarshaler] interface.

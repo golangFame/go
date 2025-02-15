@@ -8,6 +8,7 @@
 // The package is typically only imported for the side effect of
 // registering its HTTP handlers.
 // The handled paths all begin with /debug/pprof/.
+// As of Go 1.22, all the paths must be requested with GET.
 //
 // To use pprof, link this package into your program:
 //
@@ -75,6 +76,7 @@ import (
 	"context"
 	"fmt"
 	"html"
+	"internal/godebug"
 	"internal/profile"
 	"io"
 	"log"
@@ -84,18 +86,22 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 )
 
 func init() {
-	http.HandleFunc("/debug/pprof/", Index)
-	http.HandleFunc("/debug/pprof/cmdline", Cmdline)
-	http.HandleFunc("/debug/pprof/profile", Profile)
-	http.HandleFunc("/debug/pprof/symbol", Symbol)
-	http.HandleFunc("/debug/pprof/trace", Trace)
+	prefix := ""
+	if godebug.New("httpmuxgo121").Value() != "1" {
+		prefix = "GET "
+	}
+	http.HandleFunc(prefix+"/debug/pprof/", Index)
+	http.HandleFunc(prefix+"/debug/pprof/cmdline", Cmdline)
+	http.HandleFunc(prefix+"/debug/pprof/profile", Profile)
+	http.HandleFunc(prefix+"/debug/pprof/symbol", Symbol)
+	http.HandleFunc(prefix+"/debug/pprof/trace", Trace)
 }
 
 // Cmdline responds with the running program's
@@ -361,6 +367,7 @@ var profileDescriptions = map[string]string{
 	"heap":         "A sampling of memory allocations of live objects. You can specify the gc GET parameter to run GC before taking the heap sample.",
 	"mutex":        "Stack traces of holders of contended mutexes",
 	"profile":      "CPU profile. You can specify the duration in the seconds GET parameter. After you get the profile file, use the go tool pprof command to investigate the profile.",
+	"symbol":       "Maps given program counters to function names. Counters can be specified in a GET raw query or POST body, multiple counters are separated by '+'.",
 	"threadcreate": "Stack traces that led to the creation of new OS threads",
 	"trace":        "A trace of execution of the current program. You can specify the duration in the seconds GET parameter. After you get the trace file, use the go tool trace command to investigate the trace.",
 }
@@ -398,7 +405,7 @@ func Index(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Adding other profiles exposed from within this package
-	for _, p := range []string{"cmdline", "profile", "trace"} {
+	for _, p := range []string{"cmdline", "profile", "symbol", "trace"} {
 		profiles = append(profiles, profileEntry{
 			Name: p,
 			Href: p,
@@ -406,8 +413,8 @@ func Index(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	sort.Slice(profiles, func(i, j int) bool {
-		return profiles[i].Name < profiles[j].Name
+	slices.SortFunc(profiles, func(a, b profileEntry) int {
+		return strings.Compare(a.Name, b.Name)
 	})
 
 	if err := indexTmplExecute(w, profiles); err != nil {

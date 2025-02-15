@@ -353,6 +353,7 @@ func (p *Parser) asmPCAlign(operands [][]lex.Token) {
 	prog := &obj.Prog{
 		Ctxt: p.ctxt,
 		As:   obj.APCALIGN,
+		Pos:  p.pos(),
 		From: key,
 	}
 	p.append(prog, "", true)
@@ -642,12 +643,6 @@ func (p *Parser) asmInstruction(op obj.As, cond string, a []obj.Addr) {
 				break
 			}
 		} else if p.arch.Family == sys.Loong64 {
-			if arch.IsLoong64CMP(op) {
-				prog.From = a[0]
-				prog.Reg = p.getRegister(prog, op, &a[1])
-				break
-			}
-
 			if arch.IsLoong64RDTIME(op) {
 				// The Loong64 RDTIME family of instructions is a bit special,
 				// in that both its register operands are outputs
@@ -669,9 +664,17 @@ func (p *Parser) asmInstruction(op obj.As, cond string, a []obj.Addr) {
 			prog.Reg = p.getRegister(prog, op, &a[1])
 			prog.To = a[2]
 		case sys.Loong64:
-			prog.From = a[0]
-			prog.Reg = p.getRegister(prog, op, &a[1])
-			prog.To = a[2]
+			switch {
+			// Loong64 atomic instructions with one input and two outputs.
+			case arch.IsLoong64AMO(op):
+				prog.From = a[0]
+				prog.To = a[1]
+				prog.RegTo2 = a[2].Reg
+			default:
+				prog.From = a[0]
+				prog.Reg = p.getRegister(prog, op, &a[1])
+				prog.To = a[2]
+			}
 		case sys.ARM:
 			// Special cases.
 			if arch.IsARMSTREX(op) {
@@ -820,6 +823,13 @@ func (p *Parser) asmInstruction(op obj.As, cond string, a []obj.Addr) {
 			prog.To = a[3]
 			break
 		}
+		if p.arch.Family == sys.Loong64 {
+			prog.From = a[0]
+			prog.Reg = p.getRegister(prog, op, &a[1])
+			prog.AddRestSource(a[2])
+			prog.To = a[3]
+			break
+		}
 		if p.arch.Family == sys.PPC64 {
 			prog.From = a[0]
 			prog.To = a[3]
@@ -905,6 +915,19 @@ func (p *Parser) asmInstruction(op obj.As, cond string, a []obj.Addr) {
 			prog.To = a[5]
 			break
 		}
+		if p.arch.Family == sys.RISCV64 && arch.IsRISCV64VTypeI(op) {
+			prog.From = a[0]
+			vsew := p.getSpecial(prog, op, &a[1])
+			vlmul := p.getSpecial(prog, op, &a[2])
+			vtail := p.getSpecial(prog, op, &a[3])
+			vmask := p.getSpecial(prog, op, &a[4])
+			if err := arch.RISCV64ValidateVectorType(vsew, vlmul, vtail, vmask); err != nil {
+				p.errorf("invalid vtype: %v", err)
+			}
+			prog.AddRestSourceArgs([]obj.Addr{a[1], a[2], a[3], a[4]})
+			prog.To = a[5]
+			break
+		}
 		fallthrough
 	default:
 		p.errorf("can't handle %s instruction with %d operands", op, len(a))
@@ -954,4 +977,12 @@ func (p *Parser) getRegister(prog *obj.Prog, op obj.As, addr *obj.Addr) int16 {
 		p.errorf("%s: expected register; found %s", op, obj.Dconv(prog, addr))
 	}
 	return addr.Reg
+}
+
+// getSpecial checks that addr represents a special operand and returns its value.
+func (p *Parser) getSpecial(prog *obj.Prog, op obj.As, addr *obj.Addr) int64 {
+	if addr.Type != obj.TYPE_SPECIAL || addr.Name != 0 || addr.Reg != 0 || addr.Index != 0 {
+		p.errorf("%s: expected special operand; found %s", op, obj.Dconv(prog, addr))
+	}
+	return addr.Offset
 }

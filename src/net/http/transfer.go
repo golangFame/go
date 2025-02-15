@@ -11,12 +11,13 @@ import (
 	"fmt"
 	"internal/godebug"
 	"io"
+	"maps"
 	"net/http/httptrace"
 	"net/http/internal"
 	"net/http/internal/ascii"
 	"net/textproto"
 	"reflect"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -318,7 +319,7 @@ func (t *transferWriter) writeHeader(w io.Writer, trace *httptrace.ClientTrace) 
 			keys = append(keys, k)
 		}
 		if len(keys) > 0 {
-			sort.Strings(keys)
+			slices.Sort(keys)
 			// TODO: could do better allocation-wise here, but trailers are rare,
 			// so being lazy for now.
 			if _, err := io.WriteString(w, "Trailer: "+strings.Join(keys, ",")+"\r\n"); err != nil {
@@ -350,7 +351,7 @@ func (t *transferWriter) writeBody(w io.Writer) (err error) {
 	// nopCloser or readTrackingBody. This is to ensure that we can take advantage of
 	// OS-level optimizations in the event that the body is an
 	// *os.File.
-	if t.Body != nil {
+	if !t.ResponseToHEAD && t.Body != nil {
 		var body = t.unwrapBody()
 		if chunked(t.TransferEncoding) {
 			if bw, ok := w.(*bufio.Writer); ok && !t.IsResponse {
@@ -392,7 +393,7 @@ func (t *transferWriter) writeBody(w io.Writer) (err error) {
 			t.ContentLength, ncopy)
 	}
 
-	if chunked(t.TransferEncoding) {
+	if !t.ResponseToHEAD && chunked(t.TransferEncoding) {
 		// Write Trailer header
 		if t.Trailer != nil {
 			if err := t.Trailer.Write(w); err != nil {
@@ -954,9 +955,7 @@ func mergeSetHeader(dst *Header, src Header) {
 		*dst = src
 		return
 	}
-	for k, vv := range src {
-		(*dst)[k] = vv
-	}
+	maps.Copy(*dst, src)
 }
 
 // unreadDataSizeLocked returns the number of bytes of unread input.
@@ -1043,7 +1042,7 @@ func (bl bodyLocked) Read(p []byte) (n int, err error) {
 	return bl.b.readLocked(p)
 }
 
-var laxContentLength = godebug.New("httplaxcontentlength")
+var httplaxcontentlength = godebug.New("httplaxcontentlength")
 
 // parseContentLength checks that the header is valid and then trims
 // whitespace. It returns -1 if no value is set otherwise the value
@@ -1057,8 +1056,8 @@ func parseContentLength(clHeaders []string) (int64, error) {
 	// The Content-Length must be a valid numeric value.
 	// See: https://datatracker.ietf.org/doc/html/rfc2616/#section-14.13
 	if cl == "" {
-		if laxContentLength.Value() == "1" {
-			laxContentLength.IncNonDefault()
+		if httplaxcontentlength.Value() == "1" {
+			httplaxcontentlength.IncNonDefault()
 			return -1, nil
 		}
 		return 0, badStringError("invalid empty Content-Length", cl)

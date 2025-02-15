@@ -10,9 +10,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"internal/goexperiment"
 	"internal/testenv"
-	tracev2 "internal/trace/v2"
+	traceparse "internal/trace"
 	"io"
 	"log"
 	"os"
@@ -33,8 +32,11 @@ const entrypointVar = "RUNTIME_TEST_ENTRYPOINT"
 
 func TestMain(m *testing.M) {
 	switch entrypoint := os.Getenv(entrypointVar); entrypoint {
-	case "crash":
-		crash()
+	case "panic":
+		crashViaPanic()
+		panic("unreachable")
+	case "trap":
+		crashViaTrap()
 		panic("unreachable")
 	default:
 		log.Fatalf("invalid %s: %q", entrypointVar, entrypoint)
@@ -169,7 +171,23 @@ func buildTestProg(t *testing.T, binary string, flags ...string) (string, error)
 		cmd := exec.Command(testenv.GoToolPath(t), append([]string{"build", "-o", exe}, flags...)...)
 		t.Logf("running %v", cmd)
 		cmd.Dir = "testdata/" + binary
-		out, err := testenv.CleanCmdEnv(cmd).CombinedOutput()
+		cmd = testenv.CleanCmdEnv(cmd)
+
+		// Add the rangefunc GOEXPERIMENT unconditionally since some tests depend on it.
+		// TODO(61405): Remove this once it's enabled by default.
+		edited := false
+		for i := range cmd.Env {
+			e := cmd.Env[i]
+			if _, vars, ok := strings.Cut(e, "GOEXPERIMENT="); ok {
+				cmd.Env[i] = "GOEXPERIMENT=" + vars + ",rangefunc"
+				edited = true
+			}
+		}
+		if !edited {
+			cmd.Env = append(cmd.Env, "GOEXPERIMENT=rangefunc")
+		}
+
+		out, err := cmd.CombinedOutput()
 		if err != nil {
 			target.err = fmt.Errorf("building %s %v: %v\n%s", binary, flags, err, out)
 		} else {
@@ -336,6 +354,37 @@ panic: third panic
 		t.Fatalf("output does not start with %q:\n%s", want, output)
 	}
 
+}
+
+func TestReraisedPanic(t *testing.T) {
+	output := runTestProg(t, "testprog", "ReraisedPanic")
+	want := `panic: message [recovered, reraised]
+`
+	if !strings.HasPrefix(output, want) {
+		t.Fatalf("output does not start with %q:\n%s", want, output)
+	}
+}
+
+func TestReraisedMiddlePanic(t *testing.T) {
+	output := runTestProg(t, "testprog", "ReraisedMiddlePanic")
+	want := `panic: inner [recovered]
+	panic: middle [recovered, reraised]
+	panic: outer
+`
+	if !strings.HasPrefix(output, want) {
+		t.Fatalf("output does not start with %q:\n%s", want, output)
+	}
+}
+
+func TestReraisedPanicSandwich(t *testing.T) {
+	output := runTestProg(t, "testprog", "ReraisedPanicSandwich")
+	want := `panic: outer [recovered]
+	panic: inner [recovered]
+	panic: outer
+`
+	if !strings.HasPrefix(output, want) {
+		t.Fatalf("output does not start with %q:\n%s", want, output)
+	}
 }
 
 func TestGoexitCrash(t *testing.T) {
@@ -606,8 +655,11 @@ func TestConcurrentMapWrites(t *testing.T) {
 	}
 	testenv.MustHaveGoRun(t)
 	output := runTestProg(t, "testprog", "concurrentMapWrites")
-	want := "fatal error: concurrent map writes"
-	if !strings.HasPrefix(output, want) {
+	want := "fatal error: concurrent map writes\n"
+	// Concurrent writes can corrupt the map in a way that we
+	// detect with a separate throw.
+	want2 := "fatal error: small map with no empty slot (concurrent map writes?)\n"
+	if !strings.HasPrefix(output, want) && !strings.HasPrefix(output, want2) {
 		t.Fatalf("output does not start with %q:\n%s", want, output)
 	}
 }
@@ -617,8 +669,11 @@ func TestConcurrentMapReadWrite(t *testing.T) {
 	}
 	testenv.MustHaveGoRun(t)
 	output := runTestProg(t, "testprog", "concurrentMapReadWrite")
-	want := "fatal error: concurrent map read and map write"
-	if !strings.HasPrefix(output, want) {
+	want := "fatal error: concurrent map read and map write\n"
+	// Concurrent writes can corrupt the map in a way that we
+	// detect with a separate throw.
+	want2 := "fatal error: small map with no empty slot (concurrent map writes?)\n"
+	if !strings.HasPrefix(output, want) && !strings.HasPrefix(output, want2) {
 		t.Fatalf("output does not start with %q:\n%s", want, output)
 	}
 }
@@ -628,9 +683,39 @@ func TestConcurrentMapIterateWrite(t *testing.T) {
 	}
 	testenv.MustHaveGoRun(t)
 	output := runTestProg(t, "testprog", "concurrentMapIterateWrite")
-	want := "fatal error: concurrent map iteration and map write"
-	if !strings.HasPrefix(output, want) {
+	want := "fatal error: concurrent map iteration and map write\n"
+	// Concurrent writes can corrupt the map in a way that we
+	// detect with a separate throw.
+	want2 := "fatal error: small map with no empty slot (concurrent map writes?)\n"
+	if !strings.HasPrefix(output, want) && !strings.HasPrefix(output, want2) {
 		t.Fatalf("output does not start with %q:\n%s", want, output)
+	}
+}
+
+func TestConcurrentMapWritesIssue69447(t *testing.T) {
+	testenv.MustHaveGoRun(t)
+	exe, err := buildTestProg(t, "testprog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 200; i++ {
+		output := runBuiltTestProg(t, exe, "concurrentMapWrites")
+		if output == "" {
+			// If we didn't detect an error, that's ok.
+			// This case makes this test not flaky like
+			// the other ones above.
+			// (More correctly, this case makes this test flaky
+			// in the other direction, in that it might not
+			// detect a problem even if there is one.)
+			continue
+		}
+		want := "fatal error: concurrent map writes\n"
+		// Concurrent writes can corrupt the map in a way that we
+		// detect with a separate throw.
+		want2 := "fatal error: small map with no empty slot (concurrent map writes?)\n"
+		if !strings.HasPrefix(output, want) && !strings.HasPrefix(output, want2) {
+			t.Fatalf("output does not start with %q:\n%s", want, output)
+		}
 	}
 }
 
@@ -890,10 +975,6 @@ func init() {
 }
 
 func TestCrashWhileTracing(t *testing.T) {
-	if !goexperiment.ExecTracer2 {
-		t.Skip("skipping because this test is incompatible with the legacy tracer")
-	}
-
 	testenv.MustHaveExec(t)
 
 	cmd := testenv.CleanCmdEnv(testenv.Command(t, os.Args[0]))
@@ -905,23 +986,28 @@ func TestCrashWhileTracing(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("could not start subprocess: %v", err)
 	}
-	r, err := tracev2.NewReader(stdOut)
+	r, err := traceparse.NewReader(stdOut)
 	if err != nil {
 		t.Fatalf("could not create trace.NewReader: %v", err)
 	}
 	var seen bool
+	nSync := 0
 	i := 1
 loop:
 	for ; ; i++ {
 		ev, err := r.ReadEvent()
 		if err != nil {
+			// We may have a broken tail to the trace -- that's OK.
+			// We'll make sure we saw at least one complete generation.
 			if err != io.EOF {
-				t.Errorf("error at event %d: %v", i, err)
+				t.Logf("error at event %d: %v", i, err)
 			}
 			break loop
 		}
 		switch ev.Kind() {
-		case tracev2.EventLog:
+		case traceparse.EventSync:
+			nSync = ev.Sync().N
+		case traceparse.EventLog:
 			v := ev.Log()
 			if v.Category == "xyzzy-cat" && v.Message == "xyzzy-msg" {
 				// Should we already stop reading here? More events may come, but
@@ -933,6 +1019,9 @@ loop:
 	}
 	if err := cmd.Wait(); err == nil {
 		t.Error("the process should have panicked")
+	}
+	if nSync <= 1 {
+		t.Errorf("expected at least one full generation to have been emitted before the trace was considered broken")
 	}
 	if !seen {
 		t.Errorf("expected one matching log event matching, but none of the %d received trace events match", i)
@@ -964,11 +1053,11 @@ func TestPanicWhilePanicking(t *testing.T) {
 		Func string
 	}{
 		{
-			"panic while printing panic value: important error message",
+			"panic while printing panic value: important multi-line\n\terror message",
 			"ErrorPanic",
 		},
 		{
-			"panic while printing panic value: important stringer message",
+			"panic while printing panic value: important multi-line\n\tstringer message",
 			"StringerPanic",
 		},
 		{
@@ -984,7 +1073,7 @@ func TestPanicWhilePanicking(t *testing.T) {
 			"CircularPanic",
 		},
 		{
-			"important string message",
+			"important multi-line\n\tstring message",
 			"StringPanic",
 		},
 		{
